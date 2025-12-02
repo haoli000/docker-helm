@@ -1,0 +1,215 @@
+name: Build Helm Docker Images
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC to check for new releases
+    - cron: '0 2 * * *'
+  
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force build specific version (e.g., "v3.19.2")'
+        required: false
+        default: ''
+  
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+      - 'build.sh'
+
+env:
+  DOCKER_HUB_USERNAME: haoli1
+  IMAGE_NAME: helm
+  MIN_VERSION: v3.17.0
+
+jobs:
+  find-next-version:
+    name: Find Next Version to Build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.find-version.outputs.version }}
+      should_build: ${{ steps.find-version.outputs.should_build }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Find next version to build
+        id: find-version
+        env:
+          DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
+        run: |
+          # Check if force version is specified
+          if [ -n "${{ github.event.inputs.force_version }}" ]; then
+            echo "version=${{ github.event.inputs.force_version }}" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Force building version: ${{ github.event.inputs.force_version }}"
+            exit 0
+          fi
+          
+          # Fetch all stable Helm releases (excluding rc, alpha, beta)
+          echo "Fetching Helm releases from GitHub..."
+          ALL_VERSIONS=$(curl -s "https://api.github.com/repos/helm/helm/releases?per_page=100" | \
+            jq -r '.[] | select(.prerelease == false) | .tag_name' | \
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | \
+            sort -V)
+          
+          # Filter versions >= MIN_VERSION
+          echo "Filtering versions >= $MIN_VERSION..."
+          FILTERED_VERSIONS=$(echo "$ALL_VERSIONS" | awk -v min="$MIN_VERSION" '
+            {
+              # Remove "v" prefix for comparison
+              ver = substr($0, 2)
+              min_ver = substr(min, 2)
+              
+              # Split version into parts
+              split(ver, v, ".")
+              split(min_ver, m, ".")
+              
+              # Compare major.minor.patch
+              if (v[1] > m[1]) print $0
+              else if (v[1] == m[1] && v[2] > m[2]) print $0
+              else if (v[1] == m[1] && v[2] == m[2] && v[3] >= m[3]) print $0
+            }
+          ')
+          
+          if [ -z "$FILTERED_VERSIONS" ]; then
+            echo "No versions found >= $MIN_VERSION"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Get existing tags from Docker Hub
+          echo "Checking existing images in Docker Hub..."
+          EXISTING_TAGS=$(curl -s "https://hub.docker.com/v2/repositories/${DOCKER_HUB_USERNAME}/${IMAGE_NAME}/tags?page_size=100" | \
+            jq -r '.results[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || echo "")
+          
+          # Find first version that doesn't exist
+          NEXT_VERSION=""
+          for version in $FILTERED_VERSIONS; do
+            if echo "$EXISTING_TAGS" | grep -q "^${version}$"; then
+              echo "Version $version already exists, skipping..."
+            else
+              NEXT_VERSION="$version"
+              echo "Found version to build: $NEXT_VERSION"
+              break
+            fi
+          done
+          
+          if [ -z "$NEXT_VERSION" ]; then
+            echo "All versions from $MIN_VERSION onwards are already built"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Next version to build: $NEXT_VERSION"
+          fi
+
+  build:
+    name: Build Helm ${{ needs.find-next-version.outputs.version }}
+    runs-on: ubuntu-latest
+    needs: find-next-version
+    if: needs.find-next-version.outputs.should_build == 'true'
+    
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.find-next-version.outputs.version }}
+      
+      - name: Check if this is the latest version
+        id: check-latest
+        run: |
+          CURRENT_VERSION="${{ needs.find-next-version.outputs.version }}"
+          LATEST_VERSION=$(curl -s "https://api.github.com/repos/helm/helm/releases?per_page=1" | \
+            jq -r '.[0].tag_name')
+          
+          echo "Current version: $CURRENT_VERSION"
+          echo "Latest version: $LATEST_VERSION"
+          
+          if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
+            echo "is_latest=true" >> $GITHUB_OUTPUT
+            echo "This is the latest version, will also tag as 'latest'"
+          else
+            echo "is_latest=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.find-next-version.outputs.version }}
+            ${{ steps.check-latest.outputs.is_latest == 'true' && format('{0}/{1}:latest', env.DOCKER_HUB_USERNAME, env.IMAGE_NAME) || '' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            HELM_VERSION=${{ needs.find-next-version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Test image
+        run: |
+          docker pull ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.find-next-version.outputs.version }}
+          docker run --rm ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.find-next-version.outputs.version }} version
+
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [find-next-version, build]
+    if: always()
+    
+    steps:
+      - name: Check build results
+        run: |
+          echo "## Helm Docker Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.find-next-version.outputs.should_build }}" == "true" ]; then
+            echo "**Version built:** ${{ needs.find-next-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Build status:** ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Repository:** ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ needs.build.result }}" == "success" ]; then
+              echo "✅ Image built and pushed successfully!" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Pull with:" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.find-next-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Build failed. Check the logs above." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ No new versions to build" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All versions from ${{ env.MIN_VERSION }} onwards are already built in the repository." >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # Helm v3 latest
+  helm-v3:
+    build:
+      context: .
+      args:
+        HELM_VERSION: v3.19.2
+    image: helm:v3.19.2
+    volumes:
+      - ./charts:/charts
+      - ~/.kube:/home/helm/.kube:ro
+    working_dir: /charts
+    entrypoint: ["helm"]
+    command: ["version"]
+
+  # Helm v4 latest
+  helm-v4:
+    build:
+      context: .
+      args:
+        HELM_VERSION: v4.0.1
+    image: helm:v4.0.1
+    volumes:
+      - ./charts:/charts
+      - ~/.kube:/home/helm/.kube:ro
+    working_dir: /charts
+    entrypoint: ["helm"]
+    command: ["version"]
+
+  # Lint charts with v3
+  lint-v3:
+    image: helm:v3.19.2
+    volumes:
+      - ./charts:/charts
+    command: ["lint", "/charts/*"]
+
+  # Lint charts with v4
+  lint-v4:
+    image: helm:v4.0.1
+    volumes:
+      - ./charts:/charts
+    command: ["lint", "/charts/*"]
+
+  # Interactive shell for development
+  shell:
+    image: helm:v3.19.2
+    volumes:
+      - ./charts:/charts
+      - ~/.kube:/home/helm/.kube
+    working_dir: /charts
+    stdin_open: true
+    tty: true
+    entrypoint: ["/bin/sh"]
