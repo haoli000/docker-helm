@@ -31,7 +31,7 @@ RUN set -ex && \
     tar -xzf "${HELM_FILE}" && \
     mv ${TARGETOS}-${HELM_ARCH}/helm /usr/local/bin/helm && \
     chmod +x /usr/local/bin/helm && \
-    /usr/local/bin/helm version --client
+    /usr/local/bin/helm version
 
 # Final minimal image
 ARG ALPINE_VERSION=latest
